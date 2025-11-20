@@ -1,0 +1,133 @@
+﻿# Enviroment expectations (.env file):
+# MYSQL_USR and MYSQL_PSW - user and password for ML database, use it for connect ML server with mysql tools (for inspecting data, backups, etc.)
+services:
+  # Db service for storing trained models, data sessions, etc.
+  db:
+    image: percona/percona-server:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PSW}
+    ports:
+      - "3307:3306"
+      # Workaround for no my.cnf in image.
+    command: --user=mysql --lower-case-table-names=1 --max_allowed_packet=1G
+    volumes:
+      - ml-db-volume:/var/lib/mysql
+    restart: on-failure
+  # Db structure migration tool
+  dbmigration:
+    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-flyway:${DOCKER_TAG:-4.0.148}
+    environment:
+      FLYWAY_USER: ${MYSQL_USR}
+      FLYWAY_PASSWORD: ${MYSQL_PSW}
+      FLYWAY_SCHEMAS: ml
+      FLYWAY_URL: jdbc:mysql://db?maxAllowedPacket=33554432&useSSL=false&allowPublicKeyRetrieval=true
+      FLYWAY_CONNECT_RETRIES: "30"
+      FLYWAY_BASELINE_ON_MIGRATE: "true"
+      FLYWAY_VALIDATE_ON_MIGRATE: "false"
+      FLYWAY_VALIDATE_MIGRATION_NAMING: "true"
+    command: "migrate"
+    depends_on:
+      - db
+  # RAG feature is toggled
+  # es:
+    # image: docker.elastic.co/elasticsearch/elasticsearch:8.8.2
+    # container_name: es
+    # environment:
+      # - cluster.name=es-cluster
+      # - xpack.security.enabled=false
+      # - xpack.ml.enabled=false
+      # - xpack.graph.enabled=false
+      # - xpack.watcher.enabled=false
+      # - ES_JAVA_OPTS=${ES_JAVA_OPTS}
+      # - discovery.type=single-node
+    # ulimits:
+      # memlock:
+        # soft: -1
+        # hard: -1
+    # restart: unless-stopped
+    # volumes:
+      # - es:/usr/share/elasticsearch/data
+    # ports:
+      # - 9200:9200
+  # Python models migrator
+  python-migration:
+    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-python-migration:${DOCKER_TAG:-143}
+    environment:
+      ML_DB_HOST: db
+      ML_DB_USER: ${MYSQL_USR}
+      ML_DB_PASSWORD: ${MYSQL_PSW}
+    depends_on:
+      dbmigration:
+        condition:
+          service_completed_successfully
+    dns_search: ${INTERNAL_DOMAIN}
+  # Python-computation node
+  python-predict-service:
+    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-engine-python:${DOCKER_TAG:-4.0.148}
+    environment:
+      ML_DB_HOST: db
+      ML_DB_USER: ${MYSQL_USR}
+      ML_DB_PASSWORD: ${MYSQL_PSW}
+      ML_ENGINE_PORT: 8080
+      ML_MODEL_CACHE_TYPE: "memory"
+      ML_MODEL_CACHE_EXPIRATION_SEC: "7200"
+    ports:
+      - "8081:8080"
+    depends_on:
+      python-migration:
+        condition:
+          service_completed_successfully
+    volumes:
+      - ./logs/ml-engine-predict:/usr/src/app/logs
+    dns_search: ${INTERNAL_DOMAIN}
+    restart: on-failure
+  python-task-service:
+    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-engine-python:${DOCKER_TAG:-4.0.148}
+    environment:
+      ML_DB_HOST: db
+      ML_DB_USER: ${MYSQL_USR}
+      ML_DB_PASSWORD: ${MYSQL_PSW}
+      ML_ENGINE_PORT: 8080
+      ML_MODEL_CACHE_TYPE: "memory"
+      ML_MODEL_CACHE_EXPIRATION_SEC: "7200"
+    ports:
+      - "8082:8080"
+    depends_on:
+      python-migration:
+        condition:
+          service_completed_successfully
+    volumes:
+      - ./logs/ml-engine-train:/usr/src/app/logs
+    dns_search: ${INTERNAL_DOMAIN}
+    restart: on-failure
+  # Web Api node
+  ml-service:
+    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-service:${DOCKER_TAG:-4.0.148}
+    ports:
+      - "5005:5005"
+    depends_on:
+      - python-predict-service
+    volumes:
+      - ./logs/ml-service:/app/Log
+      - ./etc/ml-service/appsettings.json:/app/appsettings.json
+      - ./etc/ml-service/log4net.config:/app/log4net.config
+    dns_search: ${INTERNAL_DOMAIN}
+    restart: on-failure
+  # Task scheduler (training queue processing)
+  ml-task-scheduler:
+    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-task-scheduler:${DOCKER_TAG:-4.0.148}
+    ports:
+      - "5004:5004"
+    depends_on:
+      - python-task-service
+    volumes:    
+      - ./logs/task-scheduler:/app/Log
+      - ./etc/task-scheduler/appsettings.json:/app/appsettings.json
+      - ./etc/task-scheduler/log4net.config:/app/log4net.config
+    dns_search: ${INTERNAL_DOMAIN}
+    restart: on-failure
+volumes:
+  ml-db-volume:
+    driver: local
+  es:
+    driver: local
