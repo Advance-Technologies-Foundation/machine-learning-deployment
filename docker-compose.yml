@@ -49,18 +49,6 @@ services:
       # - es:/usr/share/elasticsearch/data
     # ports:
       # - 9200:9200
-  # Python models migrator
-  python-migration:
-    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-python-migration:${DOCKER_TAG:-143}
-    environment:
-      ML_DB_HOST: db
-      ML_DB_USER: ${MYSQL_USR}
-      ML_DB_PASSWORD: ${MYSQL_PSW}
-    depends_on:
-      dbmigration:
-        condition:
-          service_completed_successfully
-    dns_search: ${INTERNAL_DOMAIN}
   # Python-computation node
   python-predict-service:
     image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-engine-python:${DOCKER_TAG:-4.0.148}
@@ -71,12 +59,12 @@ services:
       ML_ENGINE_PORT: 8080
       ML_MODEL_CACHE_TYPE: "memory"
       ML_MODEL_CACHE_EXPIRATION_SEC: "7200"
+      ML_ENGINE_EXTENDED_LOG_ENABLED: ${ML_ENGINE_EXTENDED_LOG_ENABLED}
     ports:
       - "8081:8080"
     depends_on:
-      python-migration:
-        condition:
-          service_completed_successfully
+      dbmigration:
+        condition: service_completed_successfully
     volumes:
       - ./logs/ml-engine-predict:/usr/src/app/logs
     dns_search: ${INTERNAL_DOMAIN}
@@ -93,9 +81,8 @@ services:
     ports:
       - "8082:8080"
     depends_on:
-      python-migration:
-        condition:
-          service_completed_successfully
+      dbmigration:
+        condition: service_completed_successfully
     volumes:
       - ./logs/ml-engine-train:/usr/src/app/logs
     dns_search: ${INTERNAL_DOMAIN}
