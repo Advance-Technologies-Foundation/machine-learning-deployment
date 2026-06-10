@@ -1,21 +1,58 @@
-﻿# Enviroment expectations (.env file):
-# MYSQL_USR and MYSQL_PSW - user and password for ML database, use it for connect ML server with mysql tools (for inspecting data, backups, etc.)
+# ML Service Docker Compose Configuration (Production-like)
+#
+# Environment expectations (.env file):
+# - MYSQL_USR: MySQL user for ML database
+# - MYSQL_PSW: MySQL password
+# - DOCKER_REGISTRY: Docker registry URL (default: registry.creatio.com)
+# - DOCKER_TAG: Docker image tag (default: 4.0.309)
+# - ML_ENGINE_EXTENDED_LOG_ENABLED: Enable extended logging (true/false)
+# - INTERNAL_DOMAIN: Internal DNS domain (optional)
+# - BUILD_PLATFORM: Platform for builds (e.g., linux/amd64, linux/arm64)
+# - ES_JAVA_OPTS: Elasticsearch JVM options (default: -Xms1g -Xmx1g)
+#
+# Usage:
+#   compose up -d
+#   compose logs -f
+#   compose down
+
 services:
-  # Db service for storing trained models, data sessions, etc.
+  # Percona Server database for storing trained models, data sessions, etc.
+  # Using Percona Server 8.0 (MySQL-compatible, enhanced performance)
   db:
     image: percona/percona-server:8.0
+    container_name: ml-percona
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_PSW}
+      MYSQL_DATABASE: ml
+      MYSQL_USER: ${MYSQL_USR}
+      MYSQL_PASSWORD: ${MYSQL_PSW}
     ports:
       - "3307:3306"
-      # Workaround for no my.cnf in image.
-    command: --user=mysql --lower-case-table-names=1 --max_allowed_packet=1G
+    command: --lower-case-table-names=1 --max_allowed_packet=1G
     volumes:
       - ml-db-volume:/var/lib/mysql
-    restart: on-failure
-  # Db structure migration tool
+      - ./mysql-init:/docker-entrypoint-initdb.d
+    networks:
+      - ml-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+    restart: unless-stopped
+  # Database structure migration tool (Flyway)
   dbmigration:
-    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-flyway:${DOCKER_TAG:-4.0.148}
+    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-flyway:${DOCKER_TAG:-4.0.309}
+    container_name: ml-flyway
     environment:
       FLYWAY_USER: ${MYSQL_USR}
       FLYWAY_PASSWORD: ${MYSQL_PSW}
@@ -26,95 +63,241 @@ services:
       FLYWAY_VALIDATE_ON_MIGRATE: "false"
       FLYWAY_VALIDATE_MIGRATION_NAMING: "true"
     command: "migrate"
+    networks:
+      - ml-network
     depends_on:
-      - db
-  # RAG feature is toggled
-  # es:
-    # image: docker.elastic.co/elasticsearch/elasticsearch:8.8.2
-    # container_name: es
-    # environment:
-      # - cluster.name=es-cluster
-      # - xpack.security.enabled=false
-      # - xpack.ml.enabled=false
-      # - xpack.graph.enabled=false
-      # - xpack.watcher.enabled=false
-      # - ES_JAVA_OPTS=${ES_JAVA_OPTS}
-      # - discovery.type=single-node
-    # ulimits:
-      # memlock:
-        # soft: -1
-        # hard: -1
-    # restart: unless-stopped
-    # volumes:
-      # - es:/usr/share/elasticsearch/data
-    # ports:
-      # - 9200:9200
-  # Python-computation node
+      db:
+        condition: service_healthy
+  # Redis cache for model caching and sessions
+  # Using Chainguard Redis image (matching Helm chart)
+  redis:
+    image: cgr.dev/chainguard/redis@sha256:aad0604bc187a436475ad4b38ddce351be42d4dbde14f22e39173c505422d76e
+    container_name: ml-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - ml-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+    restart: unless-stopped
+
+  # Elasticsearch for RAG feature and vector search
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.8
+    container_name: ml-elasticsearch
+    environment:
+      - cluster.name=ml-es-cluster
+      - node.name=ml-es-node-1
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.ml.enabled=false
+      - xpack.graph.enabled=false
+      - xpack.watcher.enabled=false
+      - ES_JAVA_OPTS=${ES_JAVA_OPTS:--Xms1g -Xmx1g}
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    ports:
+      - "9201:9200"
+    networks:
+      - ml-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+    restart: unless-stopped
+  # Python prediction service (inference/scoring)
   python-predict-service:
-    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-engine-python:${DOCKER_TAG:-4.0.148}
+    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-engine-python:${DOCKER_TAG:-4.0.309}
+    container_name: ml-python-predict
+    platform: ${BUILD_PLATFORM:-linux/amd64}
     environment:
       ML_DB_HOST: db
       ML_DB_USER: ${MYSQL_USR}
       ML_DB_PASSWORD: ${MYSQL_PSW}
       ML_ENGINE_PORT: 8080
+      ML_ENGINE_HOST: 0.0.0.0
       ML_MODEL_CACHE_TYPE: "memory"
       ML_MODEL_CACHE_EXPIRATION_SEC: "7200"
-      ML_ENGINE_EXTENDED_LOG_ENABLED: ${ML_ENGINE_EXTENDED_LOG_ENABLED}
+      ML_ENGINE_EXTENDED_LOG_ENABLED: ${ML_ENGINE_EXTENDED_LOG_ENABLED:-false}
+      ELASTICSEARCH_URL: ${ELASTICSEARCH_URL:-http://elasticsearch:9200}
     ports:
       - "8081:8080"
+    volumes:
+      - ./logs/ml-engine-predict:/usr/src/app/logs
+    networks:
+      - ml-network
+    dns_search: ${INTERNAL_DOMAIN}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/liveness')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+          cpus: '1.0'
+        reservations:
+          memory: 4G
+          cpus: '0.7'
     depends_on:
       dbmigration:
         condition: service_completed_successfully
-    volumes:
-      - ./logs/ml-engine-predict:/usr/src/app/logs
-    dns_search: ${INTERNAL_DOMAIN}
-    restart: on-failure
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Python task service (training/model building)
   python-task-service:
-    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-engine-python:${DOCKER_TAG:-4.0.148}
+    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-engine-python:${DOCKER_TAG:-4.0.309}
+    container_name: ml-python-task
+    platform: ${BUILD_PLATFORM:-linux/amd64}
     environment:
       ML_DB_HOST: db
       ML_DB_USER: ${MYSQL_USR}
       ML_DB_PASSWORD: ${MYSQL_PSW}
       ML_ENGINE_PORT: 8080
+      ML_ENGINE_HOST: 0.0.0.0
       ML_MODEL_CACHE_TYPE: "memory"
       ML_MODEL_CACHE_EXPIRATION_SEC: "7200"
+      ML_ENGINE_EXTENDED_LOG_ENABLED: ${ML_ENGINE_EXTENDED_LOG_ENABLED:-false}
+      ELASTICSEARCH_URL: ${ELASTICSEARCH_URL:-http://elasticsearch:9200}
     ports:
       - "8082:8080"
+    volumes:
+      - ./logs/ml-engine-train:/usr/src/app/logs
+    networks:
+      - ml-network
+    dns_search: ${INTERNAL_DOMAIN}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/liveness')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+          cpus: '3.0'
+        reservations:
+          memory: 640M
+          cpus: '0.3'
     depends_on:
       dbmigration:
         condition: service_completed_successfully
-    volumes:
-      - ./logs/ml-engine-train:/usr/src/app/logs
-    dns_search: ${INTERNAL_DOMAIN}
-    restart: on-failure
-  # Web Api node
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+  # ML Service - Web API for ML operations
   ml-service:
-    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-service:${DOCKER_TAG:-4.0.148}
+    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-service:${DOCKER_TAG:-4.0.309}
+    container_name: ml-service
     ports:
       - "5005:5005"
-    depends_on:
-      - python-predict-service
     volumes:
       - ./logs/ml-service:/app/Log
       - ./etc/ml-service/appsettings.json:/app/appsettings.json
       - ./etc/ml-service/log4net.config:/app/log4net.config
+    networks:
+      - ml-network
     dns_search: ${INTERNAL_DOMAIN}
-    restart: on-failure
-  # Task scheduler (training queue processing)
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5005/liveness"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '0.3'
+        reservations:
+          memory: 640M
+          cpus: '0.1'
+    depends_on:
+      python-predict-service:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ML Task Scheduler - Manages training queue and task processing
   ml-task-scheduler:
-    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-task-scheduler:${DOCKER_TAG:-4.0.148}
+    image: ${DOCKER_REGISTRY:-registry.creatio.com}/ml-task-scheduler:${DOCKER_TAG:-4.0.309}
+    container_name: ml-task-scheduler
     ports:
       - "5004:5004"
-    depends_on:
-      - python-task-service
-    volumes:    
+    volumes:
       - ./logs/task-scheduler:/app/Log
       - ./etc/task-scheduler/appsettings.json:/app/appsettings.json
       - ./etc/task-scheduler/log4net.config:/app/log4net.config
+    networks:
+      - ml-network
     dns_search: ${INTERNAL_DOMAIN}
-    restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5004/liveness"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 200M
+          cpus: '0.5'
+        reservations:
+          memory: 100M
+          cpus: '0.3'
+    depends_on:
+      python-task-service:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  ml-network:
+    driver: bridge
+    name: ml-network
+
 volumes:
   ml-db-volume:
     driver: local
-  es:
+    name: ml-db-volume
+  redis-data:
     driver: local
+    name: ml-redis-data
+  es-data:
+    driver: local
+    name: ml-es-data
